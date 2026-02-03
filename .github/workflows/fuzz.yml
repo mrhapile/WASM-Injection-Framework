@@ -1,0 +1,290 @@
+# =============================================================================
+# WASM Fuzzing CI Workflow
+# =============================================================================
+#
+# This workflow runs the WebAssembly fuzzing harness as part of CI.
+# It will FAIL the build if:
+#   1. Any panic is detected (indicates fuzzer instability)
+#   2. Any unclassified failure occurs (indicates missing error handling)
+#   3. The fuzzer itself crashes or times out
+#
+# Successful fuzzing runs (even with expected failures like invalid WASM)
+# will PASS - we only fail on unexpected/unhandled errors.
+# =============================================================================
+
+name: WASM Fuzzing CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.21'
+  WASMEDGE_VERSION: '0.13.4'
+
+jobs:
+  # ===========================================================================
+  # Unit Tests (No WasmEdge dependency)
+  # ===========================================================================
+  unit-tests:
+    name: Unit Tests & Fault Injection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run unit tests
+        run: |
+          # Run fault injection tests (no WasmEdge required)
+          # These validate error handling and panic recovery
+          go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 7
+
+  # ===========================================================================
+  # Integration Fuzzing (Requires WasmEdge)
+  # ===========================================================================
+  fuzz-corpus:
+    name: Fuzz WASM Corpus
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # -----------------------------------------------------------------------
+      # Install WasmEdge Runtime
+      # -----------------------------------------------------------------------
+      - name: Install WasmEdge
+        run: |
+          # Install WasmEdge using official installer
+          curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | \
+            bash -s -- -v ${{ env.WASMEDGE_VERSION }}
+          
+          # Add to PATH for subsequent steps
+          echo "$HOME/.wasmedge/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$HOME/.wasmedge/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "C_INCLUDE_PATH=$HOME/.wasmedge/include:$C_INCLUDE_PATH" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$HOME/.wasmedge/lib:$LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Verify WasmEdge installation
+        run: |
+          wasmedge --version
+          ls -la $HOME/.wasmedge/lib/
+
+      # -----------------------------------------------------------------------
+      # Build Fuzzing Corpus
+      # -----------------------------------------------------------------------
+      - name: Install wabt (WebAssembly Binary Toolkit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wabt
+
+      - name: Build WASM corpus from WAT files
+        run: |
+          chmod +x build_corpus.sh
+          ./build_corpus.sh
+
+      - name: List corpus files
+        run: ls -la corpus/*.wasm
+
+      # -----------------------------------------------------------------------
+      # Build and Run Fuzzer
+      # -----------------------------------------------------------------------
+      - name: Build fuzzer
+        run: |
+          # Build with integration tag to include WasmEdge code
+          go build -tags=integration -o wasm-fuzzer .
+
+      - name: Run fuzzing harness
+        id: fuzz
+        run: |
+          # Run fuzzer and capture output
+          # Continue on error so we can analyze the report
+          set +e
+          ./wasm-fuzzer ./corpus > fuzzing-report.json 2>&1
+          FUZZER_EXIT_CODE=$?
+          set -e
+          
+          # Display report for CI logs
+          echo "=== Fuzzing Report ==="
+          cat fuzzing-report.json | jq '.' || cat fuzzing-report.json
+          echo "======================"
+          
+          # Save exit code for later analysis
+          echo "fuzzer_exit_code=$FUZZER_EXIT_CODE" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Analyze Results & Determine CI Status
+      # -----------------------------------------------------------------------
+      - name: Analyze fuzzing results
+        id: analyze
+        run: |
+          # Parse the JSON report and check for CI-failing conditions
+          # 
+          # CI FAILS if:
+          #   1. Any result contains "panic recovered" in error message
+          #   2. Any failure has an empty/unknown failure_stage
+          #   3. The fuzzer crashed (non-zero exit without valid JSON)
+          
+          echo "Analyzing fuzzing results..."
+          
+          # Check if report is valid JSON
+          if ! jq empty fuzzing-report.json 2>/dev/null; then
+            echo "::error::Fuzzer output is not valid JSON - fuzzer may have crashed"
+            echo "ci_should_fail=true" >> $GITHUB_OUTPUT
+            echo "failure_reason=Invalid JSON output - fuzzer crashed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Extract statistics
+          TOTAL=$(jq '.total_files' fuzzing-report.json)
+          PASSED=$(jq '.passed' fuzzing-report.json)
+          FAILED=$(jq '.failed' fuzzing-report.json)
+          
+          echo "Total files: $TOTAL"
+          echo "Passed: $PASSED"
+          echo "Failed: $FAILED"
+          
+          # Check for panics (indicates fuzzer instability)
+          PANIC_COUNT=$(jq '[.results[] | select(.error_message != null) | select(.error_message | contains("panic"))] | length' fuzzing-report.json)
+          
+          if [ "$PANIC_COUNT" -gt 0 ]; then
+            echo "::error::Detected $PANIC_COUNT panic(s) during fuzzing"
+            jq '.results[] | select(.error_message != null) | select(.error_message | contains("panic"))' fuzzing-report.json
+            echo "ci_should_fail=true" >> $GITHUB_OUTPUT
+            echo "failure_reason=Panic detected during fuzzing" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check for unclassified failures (empty failure_stage on failed results)
+          UNCLASSIFIED=$(jq '[.results[] | select(.success == false) | select(.failure_stage == "" or .failure_stage == null)] | length' fuzzing-report.json)
+          
+          if [ "$UNCLASSIFIED" -gt 0 ]; then
+            echo "::error::Detected $UNCLASSIFIED unclassified failure(s)"
+            jq '.results[] | select(.success == false) | select(.failure_stage == "" or .failure_stage == null)' fuzzing-report.json
+            echo "ci_should_fail=true" >> $GITHUB_OUTPUT
+            echo "failure_reason=Unclassified failures detected" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # All failures are properly classified - this is expected behavior
+          echo "ci_should_fail=false" >> $GITHUB_OUTPUT
+          echo "✅ All failures are properly classified"
+          
+          # Print failure breakdown
+          echo ""
+          echo "=== Failure Breakdown ==="
+          jq '.failure_counts' fuzzing-report.json
+
+      - name: Generate summary
+        run: |
+          # Create a nice summary for the GitHub Actions UI
+          echo "## 🔍 WASM Fuzzing Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          TOTAL=$(jq '.total_files' fuzzing-report.json)
+          PASSED=$(jq '.passed' fuzzing-report.json)
+          FAILED=$(jq '.failed' fuzzing-report.json)
+          
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Files | $TOTAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Passed | $PASSED |" >> $GITHUB_STEP_SUMMARY
+          echo "| ❌ Failed | $FAILED |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Failure Breakdown" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          jq '.failure_counts' fuzzing-report.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # -----------------------------------------------------------------------
+      # Upload Artifacts
+      # -----------------------------------------------------------------------
+      - name: Upload fuzzing report
+        uses: actions/upload-artifact@v4
+        if: always()  # Upload even if previous steps failed
+        with:
+          name: fuzzing-report
+          path: |
+            fuzzing-report.json
+            corpus/*.wasm
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # Final CI Status Decision
+      # -----------------------------------------------------------------------
+      - name: Check CI status
+        if: always()
+        run: |
+          # Fail CI if analysis detected problems
+          if [ "${{ steps.analyze.outputs.ci_should_fail }}" == "true" ]; then
+            echo "::error::${{ steps.analyze.outputs.failure_reason }}"
+            exit 1
+          fi
+          
+          # Fail CI if fuzzer crashed unexpectedly
+          if [ "${{ steps.fuzz.outputs.fuzzer_exit_code }}" != "0" ]; then
+            # Check if it was a controlled failure vs crash
+            if ! jq empty fuzzing-report.json 2>/dev/null; then
+              echo "::error::Fuzzer crashed with exit code ${{ steps.fuzz.outputs.fuzzer_exit_code }}"
+              exit 1
+            fi
+          fi
+          
+          echo "✅ Fuzzing completed successfully - all failures properly classified"
+
+  # ===========================================================================
+  # Build Verification (Ensures project compiles)
+  # ===========================================================================
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify module
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build (stub mode)
+        run: go build -o wasm-fuzzer-stub .
+
+      - name: Run go vet
+        run: go vet ./...
