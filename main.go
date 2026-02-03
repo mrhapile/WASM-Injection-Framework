@@ -1,3 +1,6 @@
+//go:build integration
+// +build integration
+
 package main
 
 import (
@@ -8,36 +11,6 @@ import (
 
 	"github.com/second-state/WasmEdge-go/wasmedge"
 )
-
-// FailureStage represents the stage at which a WASM module failed
-type FailureStage string
-
-const (
-	StageNone        FailureStage = "none"
-	StageLoad        FailureStage = "load"
-	StageValidate    FailureStage = "validate"
-	StageInstantiate FailureStage = "instantiate"
-	StageExecute     FailureStage = "execute"
-)
-
-// ExecutionResult holds the structured result for a single WASM file
-type ExecutionResult struct {
-	FilePath     string        `json:"file_path"`
-	FileName     string        `json:"file_name"`
-	Success      bool          `json:"success"`
-	FailureStage FailureStage  `json:"failure_stage"`
-	ErrorMessage string        `json:"error_message,omitempty"`
-	ReturnValues []interface{} `json:"return_values,omitempty"`
-}
-
-// FuzzingReport holds the complete report for all processed files
-type FuzzingReport struct {
-	TotalFiles    int                  `json:"total_files"`
-	Passed        int                  `json:"passed"`
-	Failed        int                  `json:"failed"`
-	Results       []ExecutionResult    `json:"results"`
-	FailureCounts map[FailureStage]int `json:"failure_counts"`
-}
 
 // processWasmFile processes a single WASM file through all stages
 // It never panics - all errors are captured and returned in the result
