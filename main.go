@@ -22,20 +22,20 @@ const (
 
 // ExecutionResult holds the structured result for a single WASM file
 type ExecutionResult struct {
-	FilePath     string       `json:"file_path"`
-	FileName     string       `json:"file_name"`
-	Success      bool         `json:"success"`
-	FailureStage FailureStage `json:"failure_stage"`
-	ErrorMessage string       `json:"error_message,omitempty"`
+	FilePath     string        `json:"file_path"`
+	FileName     string        `json:"file_name"`
+	Success      bool          `json:"success"`
+	FailureStage FailureStage  `json:"failure_stage"`
+	ErrorMessage string        `json:"error_message,omitempty"`
 	ReturnValues []interface{} `json:"return_values,omitempty"`
 }
 
 // FuzzingReport holds the complete report for all processed files
 type FuzzingReport struct {
-	TotalFiles   int               `json:"total_files"`
-	Passed       int               `json:"passed"`
-	Failed       int               `json:"failed"`
-	Results      []ExecutionResult `json:"results"`
+	TotalFiles    int                  `json:"total_files"`
+	Passed        int                  `json:"passed"`
+	Failed        int                  `json:"failed"`
+	Results       []ExecutionResult    `json:"results"`
 	FailureCounts map[FailureStage]int `json:"failure_counts"`
 }
 
@@ -231,8 +231,8 @@ func main() {
 
 	if !info.IsDir() {
 		errorResult := map[string]string{
-			"error":   "path is not a directory",
-			"path":    dirPath,
+			"error": "path is not a directory",
+			"path":  dirPath,
 		}
 		json.NewEncoder(os.Stderr).Encode(errorResult)
 		os.Exit(1)
